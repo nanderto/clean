@@ -1,0 +1,42 @@
+# Rust
+/target/
+**/*.rs.bk
+**/*.swp
+**/*.swo
+Cargo.lock
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Byproducts
+*.exe
+*.dll
+*.obj
+*.pdb
+*.class
+*.pyc
+*.o
+*.a
+*.so
+*.dylib
+
+# Misc
+.idea/
+*.iml
+*.tmp
+*.bak
+*.old
+*.orig
+
+# Coverage
+/coverage/
+
+# Other
+*.crate

@@ -1,0 +1,19 @@
+[package]
+name = "clean"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+walkdir = "2.4"
+anyhow = "1.0"
+rayon = "1.8"
+colored = "2.1"
+winapi = { version = "0.3", features = [
+    "winnt",
+    "fileapi",
+    "winbase",
+    "handleapi",
+    "errhandlingapi",
+    "winerror"
+] }
