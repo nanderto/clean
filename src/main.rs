@@ -33,6 +33,10 @@ struct Args {
     /// Recursively delete non-empty directories if deletion fails (DANGEROUS)
     #[arg(long, help = "Allow deletion of system and hidden directories (DANGEROUS)")]
     delete_system_hidden: bool,
+
+    /// Run deletion in parallel (experimental)
+    #[arg(short = 'p', long, help = "Delete empty directories in parallel (experimental)")]
+    parallel: bool,
 }
 
 fn is_system_directory(path: &PathBuf) -> bool {
@@ -220,30 +224,37 @@ fn find_empty_dirs(path: &PathBuf, verbose: bool, safe_only: bool) -> Result<Vec
                     match dir_type {
                         "System" => {
                             println!("WARNING: Found empty system directory: {}", dir_path.display());
+                            println!("  {}", description);
                         }
                         "Chrome" => {
                             println!("Found empty Chrome directory: {}", dir_path.display());
+                            println!("  {}", description);
                         }
                         "GoTo" => {
                             println!("Found empty GoTo directory: {}", dir_path.display());
+                            println!("  {}", description);
                         }
                         "IsolatedStorage" => {
                             println!("Found empty IsolatedStorage directory: {}", dir_path.display());
+                            println!("  {}", description);
                         }
                         "JetBrains" => {
                             println!("Found empty JetBrains directory: {}", dir_path.display());
+                            println!("  {}", description);
                         }
                         "Cache" => {
                             println!("Found empty cache directory: {}", dir_path.display());
+                            println!("  {}", description);
                         }
                         "AppData" => {
                             println!("Found empty AppData directory: {}", dir_path.display());
+                            println!("  {}", description);
                         }
                         _ => {
                             println!("Found empty directory: {}", dir_path.display());
+                            // Do not print description for regular directories
                         }
                     }
-                    println!("  {}", description);
                     
                     // Handle verbose output if requested
                     if verbose {
@@ -366,33 +377,34 @@ fn recursive_delete_empty_dirs(path: &PathBuf, safe_only: bool, force: bool, ver
 
         // Print information about the empty directory
         let _description = get_directory_description(dir_type);
-        match dir_type {
+        let dir_label = match dir_type {
             "Chrome" | "GoTo" | "IsolatedStorage" | "JetBrains" | "Cache" | "AppData" => {
-                print!("Deleting {} directory: {}", dir_type, path.display());
+                format!("{} directory: {}", dir_type, path.display())
             }
             _ => {
-                print!("Deleting directory: {}", path.display());
+                format!("directory: {}", path.display())
             }
-        }
-
+        };
         // Try to delete the directory
         match fs::remove_dir(path) {
             Ok(_) => {
-                println!(" ✓");
+                println!("Deleted {} ✓", dir_label);
                 deleted_count += 1;
             }
             Err(e) => {
                 if force {
-                    print!(" {}", "Permission denied, attempting to force delete...".yellow());
+                    print!("Deleting {}... ", dir_label);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    print!("{}", "Permission denied, attempting to force delete...".yellow());
                     match take_ownership_and_grant_permissions(path) {
                         Ok(_) => {
                             match fs::remove_dir(path) {
                                 Ok(_) => {
-                                    println!(" ✓");
+                                    println!("Deleted {} ✓", dir_label);
                                     deleted_count += 1;
                                 }
                                 Err(e) => {
-                                    println!(" ✗");
+                                    println!("✗");
                                     eprintln!("{}", format!("Failed to force delete {}: {}", path.display(), e).red());
                                     error_count += 1;
                                     if path.exists() {
@@ -402,7 +414,7 @@ fn recursive_delete_empty_dirs(path: &PathBuf, safe_only: bool, force: bool, ver
                             }
                         }
                         Err(e) => {
-                            println!(" ✗");
+                            println!("✗");
                             eprintln!("{}", format!("Failed to take ownership of {}: {}", path.display(), e).red());
                             error_count += 1;
                             if path.exists() {
@@ -411,7 +423,9 @@ fn recursive_delete_empty_dirs(path: &PathBuf, safe_only: bool, force: bool, ver
                         }
                     }
                 } else {
-                    println!(" ✗");
+                    print!("Deleting {}... ", dir_label);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    println!("✗");
                     eprintln!("{}", format!("Failed to delete {}: {}", path.display(), e).red());
                     error_count += 1;
                     if path.exists() {
@@ -427,6 +441,184 @@ fn recursive_delete_empty_dirs(path: &PathBuf, safe_only: bool, force: bool, ver
             println!("  Directory type: {}", dir_type);
         }
         // Skip system directories
+        if dir_type == "System" {
+            if verbose {
+                println!("  Skipping system directory");
+            }
+            skipped_count += 1;
+            return Ok((deleted_count, skipped_count, error_count, failed_dirs));
+        }
+        #[cfg(windows)]
+        {
+            if is_reparse_point(path) {
+                println!("WARNING: Directory is a reparse point (junction, symlink, or mount point): {}", path.display());
+            }
+            if let Err(e) = clear_attributes_recursive(path) {
+                println!("Failed to clear attributes for {}: {}", path.display(), e);
+            }
+        }
+        match fs::remove_dir_all(path) {
+            Ok(_) => {
+                println!("Recursively deleted: {}", path.display());
+                deleted_count += 1;
+            }
+            Err(e) => {
+                println!("Failed to recursively delete {}: {}", path.display(), e);
+                error_count += 1;
+                if path.exists() {
+                    failed_dirs.push(path.clone());
+                }
+            }
+        }
+    }
+    Ok((deleted_count, skipped_count, error_count, failed_dirs))
+}
+
+fn recursive_delete_empty_dirs_parallel(path: &PathBuf, safe_only: bool, force: bool, verbose: bool, delete_system_hidden: bool) -> Result<(usize, usize, usize, Vec<PathBuf>)> {
+    let mut deleted_count = 0;
+    let mut skipped_count = 0;
+    let mut error_count = 0;
+    let mut failed_dirs = Vec::new();
+
+    // Collect subdirectories first
+    let subdirs: Vec<PathBuf> = match fs::read_dir(path) {
+        Ok(entries) => entries.filter_map(|entry| {
+            entry.ok().and_then(|e| {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    Some(e.path())
+                } else {
+                    None
+                }
+            })
+        }).collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // Process subdirectories in parallel
+    let results: Vec<_> = subdirs.par_iter().map(|subdir| {
+        recursive_delete_empty_dirs_parallel(subdir, safe_only, force, verbose, delete_system_hidden)
+    }).collect();
+
+    for res in results {
+        if let Ok((sub_deleted, sub_skipped, sub_errors, sub_failed)) = res {
+            deleted_count += sub_deleted;
+            skipped_count += sub_skipped;
+            error_count += sub_errors;
+            failed_dirs.extend(sub_failed);
+        }
+    }
+
+    // Now check if this directory is empty (same as original)
+    if is_dir_empty(path)? {
+        let dir_type = get_directory_type(path);
+        let is_hidden = is_hidden_directory(path);
+        #[cfg(windows)]
+        {
+            let sys_files = list_system_files(path, true);
+            let hidden_files = list_hidden_files(path, true);
+            if (!delete_system_hidden) && (!sys_files.is_empty() || !hidden_files.is_empty()) {
+                println!("\nWARNING: Directory contains system or hidden files and will not be deleted: {}", path.display());
+                if !sys_files.is_empty() {
+                    println!("  System files present:");
+                    for f in &sys_files {
+                        println!("    * {}", f.display());
+                    }
+                }
+                if !hidden_files.is_empty() {
+                    println!("  Hidden files present:");
+                    for f in &hidden_files {
+                        println!("    * {}", f.display());
+                    }
+                }
+                println!("  Use --delete-system-hidden to allow deletion of such directories.\n");
+                skipped_count += 1;
+                return Ok((deleted_count, skipped_count, error_count, failed_dirs));
+            }
+        }
+        if verbose {
+            println!("\nChecking directory: {}", path.display());
+            println!("  Directory type: {}", dir_type);
+            println!("  Safe only mode: {}", safe_only);
+            println!("  Is safe directory: {}", is_safe_directory(dir_type));
+            println!("  Is hidden directory: {}", is_hidden);
+        }
+        if safe_only && !is_safe_directory(dir_type) {
+            if verbose {
+                println!("  Skipping non-safe directory");
+            }
+            skipped_count += 1;
+            return Ok((deleted_count, skipped_count, error_count, failed_dirs));
+        }
+        if (is_protected_directory(dir_type) || is_hidden) && !delete_system_hidden {
+            if verbose {
+                println!("  Skipping system or hidden directory (use --delete-system-hidden to allow)");
+            }
+            skipped_count += 1;
+            return Ok((deleted_count, skipped_count, error_count, failed_dirs));
+        }
+        let _description = get_directory_description(dir_type);
+        let dir_label = match dir_type {
+            "Chrome" | "GoTo" | "IsolatedStorage" | "JetBrains" | "Cache" | "AppData" => {
+                format!("{} directory: {}", dir_type, path.display())
+            }
+            _ => {
+                format!("directory: {}", path.display())
+            }
+        };
+        match fs::remove_dir(path) {
+            Ok(_) => {
+                println!("Deleted {} ✓", dir_label);
+                deleted_count += 1;
+            }
+            Err(e) => {
+                if force {
+                    print!("Deleting {}... ", dir_label);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    print!("{}", "Permission denied, attempting to force delete...".yellow());
+                    match take_ownership_and_grant_permissions(path) {
+                        Ok(_) => {
+                            match fs::remove_dir(path) {
+                                Ok(_) => {
+                                    println!("Deleted {} ✓", dir_label);
+                                    deleted_count += 1;
+                                }
+                                Err(e) => {
+                                    println!("✗");
+                                    eprintln!("{}", format!("Failed to force delete {}: {}", path.display(), e).red());
+                                    error_count += 1;
+                                    if path.exists() {
+                                        failed_dirs.push(path.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("✗");
+                            eprintln!("{}", format!("Failed to take ownership of {}: {}", path.display(), e).red());
+                            error_count += 1;
+                            if path.exists() {
+                                failed_dirs.push(path.clone());
+                            }
+                        }
+                    }
+                } else {
+                    print!("Deleting {}... ", dir_label);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    println!("✗");
+                    eprintln!("{}", format!("Failed to delete {}: {}", path.display(), e).red());
+                    error_count += 1;
+                    if path.exists() {
+                        failed_dirs.push(path.clone());
+                    }
+                }
+            }
+        }
+    } else if delete_system_hidden {
+        let dir_type = get_directory_type(path);
+        if verbose {
+            println!("\nRecursively deleting non-empty directory: {}", path.display());
+            println!("  Directory type: {}", dir_type);
+        }
         if dir_type == "System" {
             if verbose {
                 println!("  Skipping system directory");
@@ -617,8 +809,8 @@ fn clear_attributes_recursive(path: &PathBuf) -> std::io::Result<()> {
     use std::fs;
 
     if let Ok(metadata) = fs::metadata(path) {
-        let mut attrs = metadata.file_attributes();
-        let mut new_attrs = attrs & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+        let attrs = metadata.file_attributes();
+        let new_attrs = attrs & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
         if new_attrs != attrs {
             let wide: Vec<u16> = OsStr::new(&path)
                 .encode_wide()
@@ -656,51 +848,65 @@ fn main() -> Result<()> {
         println!("\nSearching for empty directories...");
         
         // Recursively delete empty directories
-        match recursive_delete_empty_dirs(&args.path, args.safe, args.force, args.verbose, args.delete_system_hidden) {
-            Ok((deleted_count, skipped_count, error_count, failed_dirs)) => {
-                println!("\nDeletion Summary:");
-                println!("  Successfully deleted: {}", deleted_count);
-                println!("  Skipped: {}", skipped_count);
-                println!("  Errors: {}", error_count);
-                
-                if !failed_dirs.is_empty() {
-                    println!("\nDirectories that could not be deleted:");
-                    for dir in &failed_dirs {
-                        if !dir.exists() { continue; } // Skip if directory was deleted after the fact
-                        println!("  - {}", dir.display());
-                        #[cfg(windows)]
-                        {
-                            let sys_files = list_system_files(dir, true);
-                            if !sys_files.is_empty() {
-                                println!("    System files in this directory:");
-                                for f in sys_files {
-                                    println!("      * {}", f.display());
-                                }
-                            }
-                            let hidden_files = list_hidden_files(dir, true);
-                            if !hidden_files.is_empty() {
-                                println!("    Hidden files in this directory:");
-                                for f in hidden_files {
-                                    println!("      * {}", f.display());
-                                }
-                            }
-                            let locked_files = list_locked_files(dir, true);
-                            if !locked_files.is_empty() {
-                                println!("    Locked files in this directory:");
-                                for f in locked_files {
-                                    println!("      * {}", f.display());
-                                }
-                            }
-                            if is_directory_locked(dir) {
-                                println!("    The directory itself is locked (in use by another process).");
-                            }
+        let (deleted_count, skipped_count, error_count, failed_dirs) = if args.parallel {
+            println!("Running in parallel delete mode...");
+            recursive_delete_empty_dirs_parallel(&args.path, args.safe, args.force, args.verbose, args.delete_system_hidden)?
+        } else {
+            recursive_delete_empty_dirs(&args.path, args.safe, args.force, args.verbose, args.delete_system_hidden)?
+        };
+        println!("\nDeletion Summary:");
+        println!("  Successfully deleted: {}", deleted_count);
+        println!("  Skipped: {}", skipped_count);
+        println!("  Errors: {}", error_count);
+        
+        if !failed_dirs.is_empty() {
+            println!("\nDirectories that could not be deleted:");
+            let mut found_system_or_hidden = false;
+            for dir in &failed_dirs {
+                if !dir.exists() { continue; } // Skip if directory was deleted after the fact
+                // Print the root path as its full path, not as '.'
+                if dir == &args.path {
+                    println!("  - {} (root path specified)", dir.canonicalize().unwrap_or_else(|_| dir.clone()).display());
+                } else {
+                    println!("  - {}", dir.display());
+                }
+                #[cfg(windows)]
+                if args.force {
+                    let sys_files = list_system_files(dir, true);
+                    let hidden_files = list_hidden_files(dir, true);
+                    if !sys_files.is_empty() {
+                        found_system_or_hidden = true;
+                        println!("    System files in this directory:");
+                        for f in &sys_files {
+                            println!("      * {}", f.display());
                         }
                     }
-                    println!("\nNote: These directories may require elevated permissions or may be in use.");
+                    if !hidden_files.is_empty() {
+                        found_system_or_hidden = true;
+                        println!("    Hidden files in this directory:");
+                        for f in &hidden_files {
+                            println!("      * {}", f.display());
+                        }
+                    }
+                    let locked_files = list_locked_files(dir, true);
+                    if !locked_files.is_empty() {
+                        println!("    Locked files in this directory:");
+                        for f in locked_files {
+                            println!("      * {}", f.display());
+                        }
+                    }
+                    if is_directory_locked(dir) {
+                        println!("    The directory itself is locked (in use by another process).");
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("Error during deletion: {}", e);
+            if found_system_or_hidden && !args.force && !args.delete_system_hidden {
+                println!("\nNote: Some directories contain system or hidden files. Try running again with the --force and --delete-system-hidden flags to attempt forced deletion of these directories.");
+            } else if args.force {
+                println!("\nNote: These directories may be protected by the system, in use by another process, or require special permissions to delete.");
+            } else {
+                println!("\nNote: These directories may be protected by the system, in use by another process, or require special permissions to delete.");
+                println!("      Try running again with the --force flag to attempt forced deletion.");
             }
         }
     } else {
